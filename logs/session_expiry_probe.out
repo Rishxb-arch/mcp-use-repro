@@ -1,0 +1,7 @@
+reference SDK:
+  ref: call before restart ok: called tool_00 {}
+  ref: call after restart: called tool_00 {}
+mcp-use:
+  mcp-use: call before restart ok: called tool_00 {}
+  mcp-use: call #1 after restart: called tool_00 {}
+  mcp-use: call #2 after restart: called tool_00 {}

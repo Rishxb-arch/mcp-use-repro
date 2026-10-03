@@ -1,0 +1,6 @@
+venv/
+upstream/
+node_modules/
+logs/srv_*.pid
+logs/edge_server_*.log
+__pycache__/

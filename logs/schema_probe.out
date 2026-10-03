@@ -1,0 +1,17 @@
+adapter produced 16 of 16 tools; missing: []
+nullable_union         OK  -> 'nullable_union got {"q": null}'
+type_array             OK  -> 'type_array got {"q": null}'
+defs_ref               OK  -> 'defs_ref got {"a": {"x": 1.0, "y": 2.0}, "pts": [{"x": 0.0, "y": 0.0}]}'
+enum_const             OK  -> 'enum_const got {"mode": "fast", "v": 3}'
+oneof                  OK  -> 'oneof got {"u": "s"}'
+additional             OK  -> 'additional got {}'
+no_props               OK  -> 'no_props got {}'
+dollar_schema_2020     OK  -> 'dollar_schema_2020 got {"n": 2}'
+dotted_hyphen_name     OK  -> 'dotted_hyphen_name got {"user-id": "u1", "a.b": "z"}'
+res_iserror            -> '{\'error\': \'RuntimeError\', \'details\': \'boom: bad input\', \'stack\': \'Traceback (most recent call last):\\n  File "'
+res_structured         -> '{"ok": true}'
+res_structured_only    -> ''
+res_image              -> "[{'type': 'text', 'text': 'here'}, {'type': 'image', 'source_type': 'base64', 'data': 'eHh4eHh4eHh4eA==', 'mim"
+res_empty              -> ''
+res_link               -> "name='x' title=None uri=AnyUrl('file:///x.txt') description=None mimeType=None size=None icons=None annotation"
+res_embedded           -> 'embedded text'

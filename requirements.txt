@@ -1,0 +1,5 @@
+# pinned to what was tested (2026-10-03)
+mcp==1.30.0
+mcp-use==1.7.1
+uvicorn
+starlette

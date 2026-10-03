@@ -1,0 +1,1 @@
+tools the agent would see: ['tool_00', 'tool_01'] (server exposes tool_00..tool_06)

@@ -1,0 +1,395 @@
+From 7f1d93efb6b5f333970d8c21eac68c09ee8db2b5 Mon Sep 17 00:00:00 2001
+From: Rishxb-arch <270784950+Rishxb-arch@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 22:20:29 +0530
+Subject: [PATCH 1/2] fix(python): follow nextCursor when listing tools,
+ resources, and prompts
+
+List calls stopped after the first page, so later tools, resources, and
+prompts never reached the session or the agent. Follow nextCursor until
+it is exhausted, including an empty-string cursor, and stop when a cursor
+repeats.
+
+Co-Authored-By: Cursor Agent <cursoragent@cursor.com>
+---
+ .../python/mcp_use/client/connectors/base.py  | 101 +++++++++---
+ .../python/mcp_use/client/connectors/http.py  |  26 +--
+ .../python/tests/unit/test_list_pagination.py | 151 ++++++++++++++++++
+ 3 files changed, 250 insertions(+), 28 deletions(-)
+ create mode 100644 libraries/python/tests/unit/test_list_pagination.py
+
+diff --git a/libraries/python/mcp_use/client/connectors/base.py b/libraries/python/mcp_use/client/connectors/base.py
+index 117aee08..87e6654e 100644
+--- a/libraries/python/mcp_use/client/connectors/base.py
++++ b/libraries/python/mcp_use/client/connectors/base.py
+@@ -7,6 +7,7 @@ must implement.
+ 
+ import warnings
+ from abc import ABC, abstractmethod
++from collections.abc import Awaitable, Callable
+ from datetime import timedelta
+ from typing import Any
+ 
+@@ -46,6 +47,61 @@ from mcp_use.logging import logger
+ from mcp_use.telemetry.telemetry import telemetry
+ 
+ 
++class RepeatedCursorError(RuntimeError):
++    """Raised when a paginated MCP list repeats a cursor.
++
++    Attributes:
++        cursor: The cursor that was returned more than once.
++        items: Items collected from pages before the repeated cursor.
++    """
++
++    def __init__(self, cursor: str, items: list[Any]) -> None:
++        super().__init__(f"Repeated pagination cursor: {cursor!r}")
++        self.cursor = cursor
++        self.items = items
++
++
++async def _collect_paginated(list_page: Callable[..., Awaitable[Any]], item_attr: str) -> list[Any]:
++    """Follow ``nextCursor`` until the server has no further page.
++
++    An empty string is a real cursor, so the list is exhausted only when
++    ``next_cursor is None``. A cursor that appears twice is logged and raised
++    so the loop stops. Non-string cursors are treated as the end of the list.
++
++    Args:
++        list_page: ``client_session.list_tools``, ``list_resources``, or ``list_prompts``.
++        item_attr: Attribute holding this page's items (``tools``, ``resources``, or ``prompts``).
++
++    Returns:
++        Items from every page, in order.
++
++    Raises:
++        RepeatedCursorError: When ``nextCursor`` repeats a cursor already followed.
++    """
++    items: list[Any] = []
++    cursor: str | None = None
++    seen: set[str] = set()
++    while True:
++        result = await list_page() if cursor is None else await list_page(cursor=cursor)
++        if not result:
++            return items
++        page = getattr(result, item_attr, None) or []
++        items.extend(page)
++        next_cursor = getattr(result, "nextCursor", None)
++        # "" is a valid cursor; only None (or a non-string) ends the list.
++        if next_cursor is None or not isinstance(next_cursor, str):
++            return items
++        if next_cursor in seen:
++            logger.error(
++                "Repeated pagination cursor %r while listing %s; stopping",
++                next_cursor,
++                item_attr,
++            )
++            raise RepeatedCursorError(next_cursor, items)
++        seen.add(next_cursor)
++        cursor = next_cursor
++
++
+ class BaseConnector(ABC):
+     """Base class for MCP connectors.
+ 
+@@ -265,10 +321,11 @@ class BaseConnector(ABC):
+         self.capabilities = result.capabilities
+ 
+         if self.capabilities.tools:
+-            # Get available tools directly from client session
++            # Get available tools directly from client session, following nextCursor.
+             try:
+-                tools_result = await self.client_session.list_tools()
+-                self._tools = tools_result.tools if tools_result else []
++                self._tools = await _collect_paginated(self.client_session.list_tools, "tools")
++            except RepeatedCursorError as e:
++                self._tools = e.items
+             except Exception as e:
+                 logger.error(f"Error listing tools for connector {self.public_identifier}: {e}")
+                 self._tools = []
+@@ -276,10 +333,11 @@ class BaseConnector(ABC):
+             self._tools = []
+ 
+         if self.capabilities.resources:
+-            # Get available resources directly from client session
++            # Get available resources directly from client session, following nextCursor.
+             try:
+-                resources_result = await self.client_session.list_resources()
+-                self._resources = resources_result.resources if resources_result else []
++                self._resources = await _collect_paginated(self.client_session.list_resources, "resources")
++            except RepeatedCursorError as e:
++                self._resources = e.items
+             except Exception as e:
+                 logger.error(f"Error listing resources for connector {self.public_identifier}: {e}")
+                 self._resources = []
+@@ -287,10 +345,11 @@ class BaseConnector(ABC):
+             self._resources = []
+ 
+         if self.capabilities.prompts:
+-            # Get available prompts directly from client session
++            # Get available prompts directly from client session, following nextCursor.
+             try:
+-                prompts_result = await self.client_session.list_prompts()
+-                self._prompts = prompts_result.prompts if prompts_result else []
++                self._prompts = await _collect_paginated(self.client_session.list_prompts, "prompts")
++            except RepeatedCursorError as e:
++                self._prompts = e.items
+             except Exception as e:
+                 logger.error(f"Error listing prompts for connector {self.public_identifier}: {e}")
+                 self._prompts = []
+@@ -490,9 +549,11 @@ class BaseConnector(ABC):
+ 
+         logger.debug("Listing tools")
+         try:
+-            result = await self.client_session.list_tools()
+-            self._tools = result.tools
+-            return result.tools
++            self._tools = await _collect_paginated(self.client_session.list_tools, "tools")
++            return self._tools
++        except RepeatedCursorError as e:
++            self._tools = e.items
++            raise
+         except McpError as e:
+             logger.error(f"Error listing tools for connector {self.public_identifier}: {e}")
+             return []
+@@ -510,9 +571,11 @@ class BaseConnector(ABC):
+ 
+         logger.debug("Listing resources")
+         try:
+-            result = await self.client_session.list_resources()
+-            self._resources = result.resources
+-            return result.resources
++            self._resources = await _collect_paginated(self.client_session.list_resources, "resources")
++            return self._resources
++        except RepeatedCursorError as e:
++            self._resources = e.items
++            raise
+         except McpError as e:
+             logger.warning(f"Error listing resources for connector {self.public_identifier}: {e}")
+             return []
+@@ -538,9 +601,11 @@ class BaseConnector(ABC):
+ 
+         logger.debug("Listing prompts")
+         try:
+-            result = await self.client_session.list_prompts()
+-            self._prompts = result.prompts
+-            return result.prompts
++            self._prompts = await _collect_paginated(self.client_session.list_prompts, "prompts")
++            return self._prompts
++        except RepeatedCursorError as e:
++            self._prompts = e.items
++            raise
+         except McpError as e:
+             logger.error(f"Error listing prompts for connector {self.public_identifier}: {e}")
+             return []
+diff --git a/libraries/python/mcp_use/client/connectors/http.py b/libraries/python/mcp_use/client/connectors/http.py
+index f41ebb4c..686a1b94 100644
+--- a/libraries/python/mcp_use/client/connectors/http.py
++++ b/libraries/python/mcp_use/client/connectors/http.py
+@@ -14,7 +14,7 @@ from mcp.shared.exceptions import McpError
+ from mcp.types import Root
+ 
+ from mcp_use.client.auth.oauth import BearerAuth, OAuth, OAuthClientProvider
+-from mcp_use.client.connectors.base import BaseConnector
++from mcp_use.client.connectors.base import BaseConnector, RepeatedCursorError, _collect_paginated
+ from mcp_use.client.exceptions import OAuthAuthenticationError, OAuthDiscoveryError
+ from mcp_use.client.middleware import CallbackClientSession, Middleware
+ from mcp_use.client.task_managers import SseConnectionManager, StreamableHttpConnectionManager
+@@ -211,23 +211,29 @@ class HttpConnector(BaseConnector):
+                 server_capabilities = result.capabilities
+ 
+                 if server_capabilities.tools:
+-                    # Get available tools directly from client session
+-                    tools_result = await self.client_session.list_tools()
+-                    self._tools = tools_result.tools if tools_result else []
++                    # Get available tools directly from client session, following nextCursor.
++                    try:
++                        self._tools = await _collect_paginated(self.client_session.list_tools, "tools")
++                    except RepeatedCursorError as e:
++                        self._tools = e.items
+                 else:
+                     self._tools = []
+ 
+                 if server_capabilities.resources:
+-                    # Get available resources directly from client session
+-                    resources_result = await self.client_session.list_resources()
+-                    self._resources = resources_result.resources if resources_result else []
++                    # Get available resources directly from client session, following nextCursor.
++                    try:
++                        self._resources = await _collect_paginated(self.client_session.list_resources, "resources")
++                    except RepeatedCursorError as e:
++                        self._resources = e.items
+                 else:
+                     self._resources = []
+ 
+                 if server_capabilities.prompts:
+-                    # Get available prompts directly from client session
+-                    prompts_result = await self.client_session.list_prompts()
+-                    self._prompts = prompts_result.prompts if prompts_result else []
++                    # Get available prompts directly from client session, following nextCursor.
++                    try:
++                        self._prompts = await _collect_paginated(self.client_session.list_prompts, "prompts")
++                    except RepeatedCursorError as e:
++                        self._prompts = e.items
+                 else:
+                     self._prompts = []
+ 
+diff --git a/libraries/python/tests/unit/test_list_pagination.py b/libraries/python/tests/unit/test_list_pagination.py
+new file mode 100644
+index 00000000..a8a701c4
+--- /dev/null
++++ b/libraries/python/tests/unit/test_list_pagination.py
+@@ -0,0 +1,151 @@
++"""Unit tests for paginated tools, resources, and prompts listing."""
++
++from types import SimpleNamespace
++from unittest.mock import patch
++
++import pytest
++from mcp.types import Prompt, Resource, Tool
++
++from mcp_use.client.connectors.base import BaseConnector, RepeatedCursorError
++
++
++class _ListingConnector(BaseConnector):
++    """Minimal connector so list helpers can be exercised without a transport."""
++
++    async def connect(self) -> None:
++        self._connected = True
++
++    @property
++    def public_identifier(self) -> str:
++        return "listing-test"
++
++
++def _tool(name: str) -> Tool:
++    return Tool(name=name, description=name, inputSchema={"type": "object"})
++
++
++def _resource(name: str) -> Resource:
++    return Resource(name=name, uri=f"file:///{name}")
++
++
++def _prompt(name: str) -> Prompt:
++    return Prompt(name=name, description=name)
++
++
++class _PagingSession:
++    """Fake client session whose list methods return scripted pages."""
++
++    def __init__(self, pages: dict[str, list[tuple[list, str | None]]]) -> None:
++        self._pages = pages
++        self.calls: dict[str, list[str | None]] = {name: [] for name in pages}
++        self.init_result = SimpleNamespace(capabilities=SimpleNamespace(tools=True, resources=True, prompts=True))
++
++    def _page(self, method: str, attr: str, cursor: str | None):
++        self.calls[method].append(cursor)
++        items, nxt = self._pages[method][len(self.calls[method]) - 1]
++        page = SimpleNamespace(nextCursor=nxt)
++        setattr(page, attr, items)
++        return page
++
++    async def initialize(self):
++        return self.init_result
++
++    async def list_tools(self, cursor: str | None = None):
++        return self._page("tools", "tools", cursor)
++
++    async def list_resources(self, cursor: str | None = None):
++        return self._page("resources", "resources", cursor)
++
++    async def list_prompts(self, cursor: str | None = None):
++        return self._page("prompts", "prompts", cursor)
++
++
++def _ready(session: _PagingSession) -> _ListingConnector:
++    connector = _ListingConnector()
++    connector.client_session = session  # type: ignore[assignment]
++    connector._connected = True
++    return connector
++
++
++def _names(items: list) -> list[str]:
++    return [item.name for item in items]
++
++
++THREE_PAGES = {
++    "tools": [([_tool("t0"), _tool("t1")], "c1"), ([_tool("t2")], ""), ([_tool("t3"), _tool("t4")], None)],
++    "resources": [([_resource("r0")], "c1"), ([_resource("r1")], ""), ([_resource("r2")], None)],
++    "prompts": [([_prompt("p0")], "c1"), ([_prompt("p1")], ""), ([_prompt("p2")], None)],
++}
++
++NO_PAGES = {
++    "tools": [([_tool("t0"), _tool("t1")], None)],
++    "resources": [([_resource("r0")], None)],
++    "prompts": [([_prompt("p0"), _prompt("p1"), _prompt("p2")], None)],
++}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("method", "kind"),
++    [("list_tools", "tools"), ("list_resources", "resources"), ("list_prompts", "prompts")],
++)
++async def test_list_follows_next_cursor_across_three_pages(method: str, kind: str) -> None:
++    """Three pages are concatenated, and an empty-string cursor is still followed."""
++    session = _PagingSession(THREE_PAGES)
++    connector = _ready(session)
++
++    items = await getattr(connector, method)()
++
++    expected = [item for page, _cursor in THREE_PAGES[kind] for item in page]
++    assert _names(items) == _names(expected)
++    assert session.calls[kind] == [None, "c1", ""]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("method", "kind"),
++    [("list_tools", "tools"), ("list_resources", "resources"), ("list_prompts", "prompts")],
++)
++async def test_list_without_pagination_calls_once(method: str, kind: str) -> None:
++    """A missing nextCursor returns the single page and does not request another."""
++    session = _PagingSession(NO_PAGES)
++    connector = _ready(session)
++
++    items = await getattr(connector, method)()
++
++    expected = NO_PAGES[kind][0][0]
++    assert _names(items) == _names(expected)
++    assert session.calls[kind] == [None]
++
++
++@pytest.mark.asyncio
++async def test_repeated_cursor_raises_logs_and_stops() -> None:
++    """A cursor that comes back twice is logged, raised, and not followed again."""
++    session = _PagingSession({"tools": [([_tool("t0")], "again"), ([_tool("t1")], "again")]})
++    connector = _ready(session)
++
++    with patch("mcp_use.client.connectors.base.logger") as mocked_logger:
++        with pytest.raises(RepeatedCursorError) as exc_info:
++            await connector.list_tools()
++
++    assert session.calls["tools"] == [None, "again"]
++    assert _names(exc_info.value.items) == ["t0", "t1"]
++    assert connector._tools is not None
++    assert _names(connector._tools) == ["t0", "t1"]
++    mocked_logger.error.assert_called_once()
++    assert "again" in mocked_logger.error.call_args.args[1]
++
++
++@pytest.mark.asyncio
++async def test_initialize_collects_every_page() -> None:
++    """Session startup caches tools, resources, and prompts from every page."""
++    session = _PagingSession(THREE_PAGES)
++    connector = _ready(session)
++
++    result = await connector.initialize()
++
++    assert result is session.init_result
++    assert _names(connector._tools or []) == ["t0", "t1", "t2", "t3", "t4"]
++    assert _names(connector._resources or []) == ["r0", "r1", "r2"]
++    assert _names(connector._prompts or []) == ["p0", "p1", "p2"]
++    assert session.calls["tools"] == [None, "c1", ""]
+-- 
+2.47.1
+
